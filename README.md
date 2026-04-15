@@ -1,6 +1,146 @@
 # AI News Claim Verifier
 
-An **Agentic RAG** (Retrieval-Augmented Generation) system for verifying claims and detecting misinformation, built with LangChain, LangGraph, ChromaDB, Tavily, and FastAPI. Used on Browser via a chrome extension
+An **Agentic RAG** (Retrieval-Augmented Generation) system for verifying claims and detecting misinformation, built with LangChain, LangGraph, ChromaDB, Tavily, and FastAPI. Used in-browser via a Chrome extension — highlight any headline, right-click, and get an instant AI-powered verdict with cited sources.
+
+---
+
+## Live Demo
+
+The following walkthrough shows the extension running on real news articles. Each step illustrates a different path through the verification pipeline.
+
+---
+
+### Step 1 — RAG Hit → Verdict: FALSE
+
+> **Claim:** *"Karachi Port significantly damaged due to Indian strike"*  
+> **Source:** Economic Times (India/Pakistan conflict coverage)
+
+The claim is checked against the local knowledge base. The **RAG retriever finds relevant evidence** and the LLM concludes the claim is **false** — initial reports were based on hacked social media accounts of the Karachi Port Trust, which were later corrected. The port was confirmed operational.
+
+![RAG Hit — FALSE verdict with cited sources](artifacts/1_HEADLINE_1_RAG_HIT.png)
+
+**What to notice:**
+- The `RAG Store` badge in the bottom-right corner — no web search was needed.
+- Numbered inline citations `[2]`, `[3]`, `[4]` map to the sources listed below the analysis.
+- Confidence was high enough (`evidence_found=True`, `confidence > 0.7`) to skip the web fallback.
+
+---
+
+### Step 2 — RAG Miss → Web Search → Verdict: TRUE
+
+> **Claim:** *"US to cut tariffs on India to 18%, India agrees to end Russian oil purchases"*  
+> **Source:** Reuters (February 2026 trade deal)
+
+This is a recent news story **not yet in the local knowledge base**. The retriever finds no sufficient evidence, so the agent falls back to **Tavily web search**, fetches 5 live results, and re-evaluates.
+
+![RAG Miss — Web fallback — TRUE verdict](artifacts/2_HEADLINE_2_RAG_MISS.png)
+
+**What to notice:**
+- The `WEB` badge — the answer came from live web results, not local storage.
+- Multiple corroborating sources (Reuters, India Briefing, NBC News, BBC, IP Defense Forum) are all cited.
+- The analysis acknowledges a nuance: the joint statement did not explicitly mention the Russian oil commitment, but the overall evidence strongly supports the claim.
+- Behind the scenes, all 5 web results are now being **chunked, embedded, and stored** in ChromaDB for future queries.
+
+---
+
+### Step 3 — RAG Hit (after web sync) → Verdict: TRUE
+
+> **Claim:** *"US to cut tariffs on India to 18%"*  
+> **Source:** Same Reuters article as Step 2
+
+Immediately after Step 2, the web search results were synced back into the vector store. A follow-up claim about the **same topic** now hits the local knowledge base directly — no web call needed.
+
+![Second query on same topic now served from RAG Store](artifacts/3_HEADLINE_2_RAG_HIT.png)
+
+**What to notice:**
+- The badge has switched back to `RAG Store` — the self-improving KB is working.
+- The analysis is more confident and concise because the evidence is already clean and pre-retrieved.
+- Subsequent queries about this trade deal will always be answered locally, with proper source attribution back to the original Reuters URLs.
+
+---
+
+## How It Works
+
+The system verifies claims through an **LLM-driven** evaluation workflow. There are no hard-coded distance thresholds or similarity cut-offs — the LLM itself decides whether the retrieved evidence is sufficient.
+
+### Step-by-step flow
+
+1. **Retrieve** — The user's claim is run through a hybrid retrieval pipeline:
+   - A **vector similarity search** (ChromaDB, cosine) fetches the top-20 semantically similar chunks
+   - A **BM25 keyword search** fetches the top-20 keyword-matched chunks from the same corpus
+   - Both candidate sets are merged with weighted fusion (70% vector / 30% BM25)
+   - A **FlashRank cross-encoder** re-ranks the merged candidates and selects the top 5
+
+2. **Evaluate (RAG)** — The top-5 re-ranked documents are passed to **GPT-4o** along with the claim. The LLM returns a structured `ClaimEvaluation`:
+   - `evidence_found` (bool) — did the documents contain relevant information?
+   - `confidence` (float, 0.0 – 1.0) — how well does the evidence address the claim?
+   - `claim_verdict` (bool) — is the claim true based on the evidence?
+   - `verification_data` (str) — detailed analysis
+
+3. **Route** — The agent checks the LLM's own assessment:
+   - If `evidence_found=True` **and** `confidence > 0.7` → skip to final output (local KB was sufficient) — badge shows **RAG Store**
+   - Otherwise → fall back to web search — badge shows **WEB**
+
+4. **Web Search** — The claim is sent to the **Tavily API** which returns up to 5 web results with titles, URLs, and content snippets.
+
+5. **Evaluate (Web)** — The same GPT-4o evaluation runs again, this time against the web results, producing a fresh `ClaimEvaluation`.
+
+6. **Sync to RAG** — The web results are individually processed: each result is chunked, tagged with rich metadata (`source_url`, `title`, `source_type`, `query`), embedded, and added to ChromaDB with proper source attribution for future citation.
+
+7. **Format Output** — The final verdict is packaged into a structured JSON response and returned to the caller.
+
+### Agent Graph (LangGraph)
+
+The workflow is implemented as a **6-node LangGraph** state machine, compiled once at startup and reused across all requests.
+
+```
+          ┌───────────┐
+          │   START   │
+          └─────┬─────┘
+                │
+          ┌─────▼─────┐
+          │  retrieve  │  Hybrid (Vector + BM25) → FlashRank re-rank → top 5
+          └─────┬─────┘
+                │
+        ┌───────▼────────┐
+        │  evaluate_rag  │  GPT-4o: evidence_found? confidence? claim_verdict?
+        └───────┬────────┘
+                │
+        ┌───────▼────────┐
+        │     route      │  evidence_found AND confidence > 0.7 ?
+        └──┬──────────┬──┘
+       Yes │          │ No
+           │          │
+           │    ┌─────▼────────┐
+           │    │  web_search  │  Tavily API → 5 results
+           │    └─────┬────────┘
+           │          │
+           │    ┌─────▼────────┐
+           │    │ evaluate_web │  GPT-4o: re-evaluate against web evidence
+           │    └─────┬────────┘
+           │          │
+           │    ┌─────▼────────┐
+           │    │ sync_to_rag  │  Chunk + embed web results → ChromaDB
+           │    └─────┬────────┘
+           │          │
+        ┌──▼──────────▼──┐
+        │  format_output  │  Build JSON response
+        └────────┬────────┘
+                 │
+           ┌─────▼─────┐
+           │    END    │
+           └───────────┘
+```
+
+### Self-Improving Knowledge Base
+
+Every time the web search path is taken, new knowledge is automatically ingested back into the vector store:
+- Each web result is processed individually with its own metadata
+- Chunks are tagged with `source_url` (actual URL), `title`, `source_type` ("web"), and the original `query`
+- Each chunk is embedded and stored in ChromaDB with full provenance
+- Retriever caches are cleared so the next query sees the updated corpus
+
+This means the first query about a new topic triggers a web search, but subsequent queries on the same topic are answered entirely from local knowledge **with proper source citations** — as shown in [Step 2 → Step 3](#step-2--rag-miss--web-search--verdict-true) above.
 
 ---
 
@@ -113,91 +253,6 @@ For in-browser claim verification:
 4. Highlight text on any webpage, right-click, and select **"Verify claim"**
 
 See [`extension/README.md`](extension/README.md) for detailed instructions.
-
----
-
-## How It Works
-
-The system verifies claims through an **LLM-driven** evaluation workflow. There are no hard-coded distance thresholds or similarity cut-offs — the LLM itself decides whether the retrieved evidence is sufficient.
-
-### Step-by-step flow
-
-1. **Retrieve** — The user's claim is run through a hybrid retrieval pipeline:
-   - A **vector similarity search** (ChromaDB, cosine) fetches the top-20 semantically similar chunks
-   - A **BM25 keyword search** fetches the top-20 keyword-matched chunks from the same corpus
-   - Both candidate sets are merged with weighted fusion (70% vector / 30% BM25)
-   - A **FlashRank cross-encoder** re-ranks the merged candidates and selects the top 5
-
-2. **Evaluate (RAG)** — The top-5 re-ranked documents are passed to **GPT-4o** along with the claim. The LLM returns a structured `ClaimEvaluation`:
-   - `evidence_found` (bool) — did the documents contain relevant information?
-   - `confidence` (float, 0.0 – 1.0) — how well does the evidence address the claim?
-   - `claim_verdict` (bool) — is the claim true based on the evidence?
-   - `verification_data` (str) — detailed analysis
-
-3. **Route** — The agent checks the LLM's own assessment:
-   - If `evidence_found=True` **and** `confidence > 0.7` → skip to final output (local KB was sufficient)
-   - Otherwise → fall back to web search
-
-4. **Web Search** — The claim is sent to the **Tavily API** which returns up to 5 web results with titles, URLs, and content snippets.
-
-5. **Evaluate (Web)** — The same GPT-4o evaluation runs again, this time against the web results, producing a fresh `ClaimEvaluation`.
-
-6. **Sync to RAG** — The web results are individually processed: each result is chunked, tagged with rich metadata (`source_url`, `title`, `source_type`, `query`), embedded, and added to ChromaDB with proper source attribution for future citation.
-
-7. **Format Output** — The final verdict is packaged into a structured JSON response and returned to the caller.
-
-### Agent Graph (LangGraph)
-
-The workflow is implemented as a **6-node LangGraph** state machine, compiled once at startup and reused across all requests.
-
-```
-          ┌───────────┐
-          │   START   │
-          └─────┬─────┘
-                │
-          ┌─────▼─────┐
-          │  retrieve  │  Hybrid (Vector + BM25) → FlashRank re-rank → top 5
-          └─────┬─────┘
-                │
-        ┌───────▼────────┐
-        │  evaluate_rag  │  GPT-4o: evidence_found? confidence? claim_verdict?
-        └───────┬────────┘
-                │
-        ┌───────▼────────┐
-        │     route      │  evidence_found AND confidence > 0.7 ?
-        └──┬──────────┬──┘
-       Yes │          │ No
-           │          │
-           │    ┌─────▼────────┐
-           │    │  web_search  │  Tavily API → 5 results
-           │    └─────┬────────┘
-           │          │
-           │    ┌─────▼────────┐
-           │    │ evaluate_web │  GPT-4o: re-evaluate against web evidence
-           │    └─────┬────────┘
-           │          │
-           │    ┌─────▼────────┐
-           │    │ sync_to_rag  │  Chunk + embed web results → ChromaDB
-           │    └─────┬────────┘
-           │          │
-        ┌──▼──────────▼──┐
-        │  format_output  │  Build JSON response
-        └────────┬────────┘
-                 │
-           ┌─────▼─────┐
-           │    END    │
-           └───────────┘
-```
-
-### Self-Improving Knowledge Base
-
-Every time the web search path is taken, new knowledge is automatically ingested back into the vector store:
-- Each web result is processed individually with its own metadata
-- Chunks are tagged with `source_url` (actual URL), `title`, `source_type` ("web"), and the original `query`
-- Each chunk is embedded and stored in ChromaDB with full provenance
-- Retriever caches are cleared so the next query sees the updated corpus
-
-This means the first query about a new topic triggers a web search, but subsequent queries on the same topic are answered entirely from local knowledge **with proper source citations**.
 
 ---
 
